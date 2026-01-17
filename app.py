@@ -2,117 +2,108 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import os
+import random
 
 app = Flask(__name__)
 CORS(app)
 
-def deepseek_algo(df):
-    # 1. Calculate Indicators
-    # EMA 200 (Long Term Trend)
-    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-    
-    # RSI (14)
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    
-    # MACD (12, 26, 9)
-    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal_line = macd.ewm(span=9, adjust=False).mean()
-
-    # Current Values
-    price = df['Close'].iloc[-1]
-    curr_ema = df['EMA_200'].iloc[-1]
-    curr_rsi = rsi.iloc[-1]
-    curr_macd = macd.iloc[-1]
-    curr_sig = signal_line.iloc[-1]
-
-    # --- DEEPSEEK LOGIC SCORING (0 to 100) ---
-    score = 0
-    decision = "WAIT"
-    direction = "NEUTRAL"
-    reason = "Analyzing Market Structure..."
-    color = "#888"
-
-    # RULE 1: TREND FILTER (Nadi ke saath baho)
-    trend = "UP" if price > curr_ema else "DOWN"
-    
-    if trend == "UP":
-        score += 20 # Points for Uptrend
-        
-        # RULE 2: RSI OVERSOLD (Sasta kharido)
-        if curr_rsi < 40: score += 30
-        if curr_rsi < 30: score += 10 # Extra points for extreme oversold
-
-        # RULE 3: MACD CROSSOVER (Green Signal)
-        if curr_macd > curr_sig: score += 40
-
-        if score >= 80:
-            decision = "DEEPSEEK BUY 🚀"
-            direction = "UP"
-            color = "#00e676"
-            reason = "Uptrend + Dip Buying + MACD Cross"
-
-    elif trend == "DOWN":
-        score += 20 # Points for Downtrend
-
-        # RULE 2: RSI OVERBOUGHT (Mehnga becho)
-        if curr_rsi > 60: score += 30
-        if curr_rsi > 70: score += 10
-
-        # RULE 3: MACD CROSSOVER (Red Signal)
-        if curr_macd < curr_sig: score += 40
-
-        if score >= 80:
-            decision = "DEEPSEEK SELL 🔻"
-            direction = "DOWN"
-            color = "#ff1744"
-            reason = "Downtrend + Rally Sell + MACD Cross"
-
-    # Chart Data Preparation
-    chart_data = {
-        "times": df.index.strftime('%H:%M').tolist()[-40:],
-        "prices": df['Close'].tolist()[-40:]
-    }
-
-    return {
-        "symbol": df.attrs.get('symbol', 'Unknown'),
-        "price": round(price, 2),
-        "decision": decision,
-        "direction": direction,
-        "score": score,
-        "reason": reason,
-        "color": color,
-        "chart": chart_data,
-        "rsi": round(curr_rsi, 2),
-        "trend": trend
-    }
-
-@app.route('/deepseek', methods=['POST'])
-def analyze():
-    data = request.json
-    symbol = data.get('symbol', 'BTC-USD')
-    
+# --- THE TRADING BRAIN ---
+def analyze_market_data(symbol):
     try:
+        # 1. Fetch Data
         stock = yf.Ticker(symbol)
-        df = stock.history(period="5d", interval="5m") # 5 Days data for accurate EMA 200
-        df.attrs['symbol'] = symbol
+        df = stock.history(period="2d", interval="5m")
+        if len(df) < 50: return None
+
+        # 2. Indicators Calculation
+        # RSI
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
         
-        if len(df) < 200:
-            return jsonify({"success": False, "error": "Not enough data for DeepSeek Logic"})
+        # EMA Trend
+        df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+        
+        # Current Values
+        price = df['Close'].iloc[-1]
+        curr_rsi = rsi.iloc[-1]
+        ema = df['EMA_200'].iloc[-1]
 
-        result = deepseek_algo(df)
-        return jsonify({"success": True, "data": result})
+        # 3. Determine Logic
+        trend = "UP" if price > ema else "DOWN"
+        
+        status = "NEUTRAL"
+        if trend == "UP" and curr_rsi < 45: status = "BULLISH (UP)"
+        elif trend == "DOWN" and curr_rsi > 55: status = "BEARISH (DOWN)"
+        elif curr_rsi > 70: status = "OVERBOUGHT (Risk of Drop)"
+        elif curr_rsi < 30: status = "OVERSOLD (Chance of Pump)"
 
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return {
+            "price": round(price, 2),
+            "rsi": round(curr_rsi, 2),
+            "trend": trend,
+            "status": status
+        }
+    except:
+        return None
+
+@app.route('/chat', methods=['POST'])
+def chat_bot():
+    data = request.json
+    user_msg = data.get('message', '').upper()
+
+    # 1. DETECT ASSET (Kaunsa Coin/Stock?)
+    symbol = "BTC-USD" # Default
+    asset_name = "Bitcoin"
+    
+    if "ETH" in user_msg: symbol = "ETH-USD"; asset_name="Ethereum"
+    elif "GOLD" in user_msg: symbol = "GC=F"; asset_name="Gold"
+    elif "EUR" in user_msg: symbol = "EURUSD=X"; asset_name="EUR/USD"
+    elif "SOL" in user_msg: symbol = "SOL-USD"; asset_name="Solana"
+
+    # 2. DETECT USER INTENT (Kya karna chahta hai?)
+    user_intent = "ASKING" # Sirf puch raha hai
+    if any(x in user_msg for x in ["BUY", "UP", "CALL", "LUN", "LE LU", "KHAREED"]): user_intent = "WANTS_UP"
+    if any(x in user_msg for x in ["SELL", "DOWN", "PUT", "GIRA", "BECH", "SHORT"]): user_intent = "WANTS_DOWN"
+
+    # 3. GET REAL DATA
+    market = analyze_market_data(symbol)
+
+    if not market:
+        return jsonify({"reply": "⚠️ Market Data connect nahi ho raha. Shayad Market band hai (Crypto try karo like BTC)."})
+
+    # 4. GENERATE AI RESPONSE (The "ChatGPT" Feel)
+    reply = ""
+
+    # SCENARIO A: User wants to BUY (UP)
+    if user_intent == "WANTS_UP":
+        if "UP" in market['status'] or "OVERSOLD" in market['status']:
+            reply = f"✅ **Haan Bhai, Sahi Soch Rahe Ho!**\n\n{asset_name} ka Trend **UP** hai aur RSI ({market['rsi']}) bhi support kar raha hai.\nYeh ek **Strong Buying Zone** hai. 🚀"
+        elif "DOWN" in market['status'] or "OVERBOUGHT" in market['status']:
+            reply = f"🛑 **RUKO! Galti Mat Karna!**\n\nTum Buy karna chahte ho, lekin Data keh raha hai ki {asset_name} **GIRNE WALA** hai.\nRSI {market['rsi']} hai (Bahut High). **Loss ho jayega, mat lo.** ⚠️"
+        else:
+            reply = f"⚠️ **Abhi Risk Hai.**\n\nMarket thoda confuse hai. RSI {market['rsi']} hai. Confirm hone ka wait karo."
+
+    # SCENARIO B: User wants to SELL (DOWN)
+    elif user_intent == "WANTS_DOWN":
+        if "DOWN" in market['status'] or "OVERBOUGHT" in market['status']:
+            reply = f"✅ **Bilkul Sahi Pakde Ho!**\n\n{asset_name} weak lag raha hai (RSI: {market['rsi']}).\nYeh **Selling/Short** karne ka sahi time hai. 📉"
+        elif "UP" in market['status'] or "OVERSOLD" in market['status']:
+            reply = f"🛑 **NAHI BHAI! Mat Becho!**\n\nMarket **UP** trend mein hai. RSI {market['rsi']} hai (Low).\nYahan se market **Pump** karega, Dump nahi. Call side dekho. 🟢"
+        else:
+            reply = f"⚠️ **Thoda Wait Karo.**\n\nTrend clear nahi hai. Zabardasti trade mat lo."
+
+    # SCENARIO C: General Question (Kaisa hai market?)
+    else:
+        trend_emoji = "🟢" if market['trend'] == "UP" else "🔴"
+        reply = f"🤖 **Analysis for {asset_name}:**\n\n• Price: ${market['price']}\n• Trend: **{market['trend']}** {trend_emoji}\n• RSI: **{market['rsi']}**\n\n👉 **AI Verdict:** Abhi Market **{market['status']}** lag raha hai."
+
+    return jsonify({"reply": reply})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+                

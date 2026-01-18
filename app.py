@@ -1,110 +1,196 @@
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-import yfinance as yf
+import requests
 import pandas as pd
-import os
-import random
+import numpy as np
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 CORS(app)
 
-# --- TRADING LOGIC (Sirf tab chalega jab maanga jayega) ---
-def analyze_market(symbol):
-    try:
-        stock = yf.Ticker(symbol)
-        df = stock.history(period="2d", interval="5m")
-        if len(df) < 20: return None
-        
-        # Calculations
-        df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        price = df['Close'].iloc[-1]
-        curr_rsi = rsi.iloc[-1]
-        ema = df['EMA_200'].iloc[-1]
-        trend = "UP" if price > ema else "DOWN"
-        
-        return {"price": round(price,2), "rsi": round(curr_rsi,2), "trend": trend}
-    except:
-        return None
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
-@app.route('/chat', methods=['POST'])
-def chat_bot():
-    data = request.json
-    raw_msg = data.get('message', '')
-    user_msg = raw_msg.upper() # Sab capital mein convert taaki samajhne me aasaani ho
+# -----------------------------
+# Indicators
+# -----------------------------
+def ema(series, period=20):
+    return series.ewm(span=period, adjust=False).mean()
 
-    # --- 1. CONVERSATIONAL LOGIC (Baat-Cheet) ---
-    
-    # Greetings
-    if any(x in user_msg for x in ["HI", "HELLO", "HEY", "NAMASTE", "KAISE HO", "SUP"]):
-        return jsonify({"reply": "Bhai main badhiya hu! 😎<br>Aaj market mein aag lagani hai ya bas timepass karna hai?<br><br>Tum kisi bhi coin ka naam likho (jaise **BTC**, **Gold**) main bata dunga kya karna hai."})
+def rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / (loss.replace(0, np.nan))
+    return 100 - (100 / (1 + rs))
 
-    # Identity
-    if any(x in user_msg for x in ["KON HAI", "NAAM KYA", "KYA KARTA HAI"]):
-        return jsonify({"reply": "Main tera **Personal Trading Assistant** hu. 🤖<br>Mera kaam hai tujhe loss se bachana aur profit karwana.<br>Koi trade lene ka mann hai?"})
+def macd(close, fast=12, slow=26, signal=9):
+    ema_fast = ema(close, fast)
+    ema_slow = ema(close, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
-    # Empathy (Loss/Profit talk)
-    if "LOSS" in user_msg:
-        return jsonify({"reply": "Arey yar, tension mat le. Loss trading ka hissa hai. 📉<br>Chill maar, agla trade soch samajh kar lenge. Bata kisme trade karna hai?"})
-    
-    if "PROFIT" in user_msg:
-        return jsonify({"reply": "Wah bhai! Party kab de raha hai? 🤑<br>Zyaada hawa mein mat udna, discipline banaye rakhna."})
+# -----------------------------
+# Candle pattern detection
+# -----------------------------
+def candle_pattern(o, h, l, c):
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
 
-    # Abuse/Angry (Handling Gussa)
-    if any(x in user_msg for x in ["PAGAL", "BEKAR", "CHUP", "BHAAG"]):
-        return jsonify({"reply": "Shaant gadadhaari Bheem, shaant! 🧘‍♂️<br>Gussa side mein rakh aur bata market kaisa chal raha hai?"})
+    # Avoid divide by zero
+    rng = max(h - l, 1e-9)
 
-    # --- 2. TRADING LOGIC (Jab Asset ka naam aaye) ---
-    
-    symbol = None
-    asset_name = ""
+    # Doji
+    if body <= 0.1 * rng:
+        return "Doji", "Neutral candle (indecision)."
 
-    if "BTC" in user_msg or "BITCOIN" in user_msg: symbol = "BTC-USD"; asset_name="Bitcoin"
-    elif "ETH" in user_msg: symbol = "ETH-USD"; asset_name="Ethereum"
-    elif "GOLD" in user_msg: symbol = "GC=F"; asset_name="Gold"
-    elif "EUR" in user_msg: symbol = "EURUSD=X"; asset_name="EUR/USD"
-    elif "SOL" in user_msg: symbol = "SOL-USD"; asset_name="Solana"
+    # Hammer / Hanging Man
+    if lower > 2 * body and upper < body:
+        return "Hammer", "Long lower wick indicates rejection from lows."
 
-    # Agar koi Asset mention nahi kiya, to pucho
-    if not symbol:
-        return jsonify({"reply": "Bhai mujhe samajh nahi aaya kya check karna hai. 🤔<br>Coin ka naam likho (jaise <b>BTC</b>, <b>ETH</b>, <b>Gold</b>) tabhi main chart dekh paunga."})
+    # Shooting Star
+    if upper > 2 * body and lower < body:
+        return "Shooting Star", "Long upper wick indicates rejection from highs."
 
-    # Agar Asset mil gaya, to Analyze karo
-    market = analyze_market(symbol)
-    
-    if not market:
-        return jsonify({"reply": f"⚠️ **{asset_name}** ka data load nahi ho raha. Shayad market band hai."})
+    return "Normal", "No strong single-candle pattern."
 
-    # AI RESPONSE GENERATION
-    reply = ""
-    trend_icon = "🟢" if market['trend'] == "UP" else "🔴"
-    
-    # User ne pucha "Buy karu?"
-    if any(x in user_msg for x in ["BUY", "LE LU", "UP", "CALL"]):
-        if market['trend'] == "UP" and market['rsi'] < 60:
-            reply = f"✅ **Haan bhai, le sakte ho!**<br>{asset_name} ka Trend UP hai {trend_icon} aur RSI {market['rsi']} hai.<br>Accha mauka hai. 🚀"
-        else:
-            reply = f"🛑 **Nahi bhai, ruk ja!**<br>Tum Buy karna chahte ho par market {market['trend']} hai ya RSI High ({market['rsi']}) hai.<br>Abhi entry risky hai."
-            
-    # User ne pucha "Sell karu?"
-    elif any(x in user_msg for x in ["SELL", "BECH", "DOWN", "PUT"]):
-        if market['trend'] == "DOWN" or market['rsi'] > 70:
-            reply = f"✅ **Sahi pakde ho!**<br>{asset_name} girne wala lag raha hai. Short/Put le sakte ho. 📉"
-        else:
-            reply = f"🛑 **Galti mat karna!**<br>{asset_name} abhi Strong hai (Trend UP). Sell karoge to fas jaoge."
-            
-    # General Analysis
+# -----------------------------
+# Fetch data
+# -----------------------------
+def fetch_klines(symbol="XAUUSDT", interval="1m", limit=120):
+    # Binance doesn't have XAUUSDT spot for all regions.
+    # You can use BTCUSDT/ETHUSDT or any available symbol.
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    res = requests.get(BINANCE_URL, params=params, timeout=10)
+    res.raise_for_status()
+    data = res.json()
+
+    df = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","qav","trades","tbbav","tbqav","ignore"
+    ])
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    return df
+
+# -----------------------------
+# Brain: scoring based signal
+# -----------------------------
+def analyze(df):
+    close = df["close"]
+    df["ema20"] = ema(close, 20)
+    df["ema50"] = ema(close, 50)
+    df["rsi14"] = rsi(close, 14)
+
+    macd_line, signal_line, hist = macd(close)
+    df["macd"] = macd_line
+    df["macd_signal"] = signal_line
+    df["macd_hist"] = hist
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # Pattern
+    pat, pat_reason = candle_pattern(
+        last["open"], last["high"], last["low"], last["close"]
+    )
+
+    # Score system (simple but effective)
+    score = 0
+    reasons_up = []
+    reasons_down = []
+    warnings = []
+
+    # EMA trend
+    if last["ema20"] > last["ema50"]:
+        score += 2
+        reasons_up.append("EMA20 above EMA50 (uptrend bias).")
     else:
-        reply = f"📊 **{asset_name} Report:**<br>• Price: ${market['price']}<br>• Trend: <b>{market['trend']}</b> {trend_icon}<br>• RSI: {market['rsi']}<br><br>Kuch puchna hai iske baare mein? (Jaise 'Buy karu?')"
+        score -= 2
+        reasons_down.append("EMA20 below EMA50 (downtrend bias).")
 
-    return jsonify({"reply": reply})
+    # Price vs EMA20
+    if last["close"] > last["ema20"]:
+        score += 1
+        reasons_up.append("Price above EMA20.")
+    else:
+        score -= 1
+        reasons_down.append("Price below EMA20.")
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-        
+    # RSI
+    r = float(last["rsi14"]) if not np.isnan(last["rsi14"]) else 50
+    if r < 30:
+        score += 1
+        reasons_up.append(f"RSI {r:.1f} (oversold bounce chance).")
+    elif r > 70:
+        score -= 1
+        reasons_down.append(f"RSI {r:.1f} (overbought pullback chance).")
+
+    # MACD histogram direction
+    if last["macd_hist"] > prev["macd_hist"]:
+        score += 1
+        reasons_up.append("MACD momentum increasing.")
+    else:
+        score -= 1
+        reasons_down.append("MACD momentum decreasing.")
+
+    # Pattern effect
+    if pat == "Hammer":
+        score += 1
+        reasons_up.append("Hammer candle → buyers defended lows.")
+    elif pat == "Shooting Star":
+        score -= 1
+        reasons_down.append("Shooting star → sellers defended highs.")
+    elif pat == "Doji":
+        warnings.append("Doji → indecision, signal weaker.")
+
+    # Volatility filter (avoid choppy)
+    recent_range = (df["high"].tail(10) - df["low"].tail(10)).mean()
+    if recent_range / last["close"] < 0.0005:
+        warnings.append("Low volatility → sideways/chop risk.")
+    if recent_range / last["close"] > 0.01:
+        warnings.append("High volatility → risky entries.")
+
+    # Signal
+    if score >= 2:
+        signal = "UP"
+        confidence = min(90, 55 + score * 10)
+        reason_list = reasons_up + (reasons_down[:1] if reasons_down else [])
+    elif score <= -2:
+        signal = "DOWN"
+        confidence = min(90, 55 + abs(score) * 10)
+        reason_list = reasons_down + (reasons_up[:1] if reasons_up else [])
+    else:
+        signal = "NO TRADE"
+        confidence = 50
+        reason_list = ["Mixed signals / choppy market."]
+
+    return {
+        "signal": signal,
+        "confidence": int(confidence),
+        "pattern": pat,
+        "pattern_note": pat_reason,
+        "reasons": reason_list[:5],
+        "warnings": warnings[:3],
+        "price": float(last["close"]),
+        "time_utc": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.get("/api/predict")
+def predict():
+    symbol = request.args.get("symbol", "BTCUSDT")   # Change default if needed
+    interval = request.args.get("interval", "1m")
+    df = fetch_klines(symbol=symbol, interval=interval, limit=120)
+    out = analyze(df)
+    out["symbol"] = symbol
+    out["interval"] = interval
+    return jsonify(out)
+
+if __name__ == "__main__":
+    # Run:
+    # python backend.py
+    app.run(host="0.0.0.0", port=5000, debug=True)
